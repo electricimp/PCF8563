@@ -43,9 +43,6 @@ This method returns the current date and time provided by the PCF8563. The data 
 | *month* | Month | 0-11; January = 0 |
 | *year*  | The year | 2000-2099 |
 | *wday*  | Day of the week | 0-6; Sunday = 0 |
-| *yday*  | Day of the year | 0-365; 1 January = 0 |
-| *time*  | Unix timestamp in whole seconds | |
-| *usec*  | Additional Unix timestamp microsecond count | |
 
 Note that the PCF8563 stores months in the calendar fashion (ie. January = 1, Febraury = 2, etc). Because Squirrel’s *date()* function zero-indexes month values (ie. January = 0, Febraury = 1, etc) the PCF8563 class does the same and modifies the stored/retrieved value automatically.
 
