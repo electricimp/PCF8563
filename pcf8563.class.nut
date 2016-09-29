@@ -31,7 +31,7 @@ class PCF8563 {
     // Properties
     _i2c = null;
     _addr = null;
-    _alarm = null;
+    _alarmData = null;
     _alarmPin = null;
     _alarmCB = null;
     _alarmFlag = false;
@@ -120,20 +120,19 @@ class PCF8563 {
         _writeDate(day, month, year, wday, hour, min, sec);
 	}
 
-    function isClockGood() {
-        // The first bit of the VL_SEC_REG is a Voltage Low flag (VL)
-        // If this flag is set, the internal voltage detector has detected a
+    function checkClock() {
+        // If bit 7 of VL_SEC_REG is set, the internal voltage detector has detected a
         // low-voltage event and the clock integrity is not guaranteed.
         // The flag remains set until it is manually cleared.
         // This is provided because the RTC is often run on a battery
-        if (0x80 & _readReg(VL_SEC_REG)) return false;
+        if (_readReg(VL_SEC_REG) & 0x80) return false;
         return true;
     }
 
-    function clearLV() {
-        // Clear the Voltage Low flag.
-        local data = 0x7F & _readReg(VL_SEC_REG);
-        _writeReg(VL_SEC_REG, data);
+    function clearClockCheck() {
+        // Clear the low-voltage flag
+        local r = _readReg(VL_SEC_REG) & 0x7F;
+        _writeReg(VL_SEC_REG, r);
     }
 
     function configureAlarm(alarmPin = null, callback = null) {
@@ -149,69 +148,97 @@ class PCF8563 {
 
         _alarmCB = callback;
         _alarmPin = alarmPin;
-
-        if (_alarmPin == _getWakepin()) {
-            // User has selected the wakeup pin
-            _alarmPin.configure(DIGITAL_IN_WAKEUP, _interrupt.bindenv(this));
-        } else {
-            _alarmPin.configure(DIGITAL_IN, _interrupt.bindenv(this));
-        }
-
-        _alarm = [-1, -1, -1, -1];
+        _alarmPin.configure(DIGITAL_IN_PULLUP, _interrupt.bindenv(this));
+        _alarmData = [0x80, 0x80, 0x80, 0x80];
     }
 
-    function setAlarm(time) {
-        local ps = ["min", "hour", "day", "wday"];
-        local ad = [0x7F, 0x3F, 0x3F, 0x03];
-        local ast = blob();
+    function setAlarm(alarm = null) {
+        if (alarm != null) {
+            // Set the alarm time using the passed table, 'alarm'
+            local params = ["min", "hour", "day", "wday"];
+            local andValue = [0x7F, 0x3F, 0x3F, 0x03];
+            local alarmBlob = blob(4);
+            local value = 0;
 
-        foreach (i, pa in ps) {
-            if (pa in time && time[pa] != null) {
-                // Set the alarm component
-                local t = _integerToBCD(time[pa] & ad[i]);
-
-                // Set bit 7 to enable the alarm
-                t = t + 0x80;
-                ast.writen(t, 'b');
-               _alarm[i] = t;
-            } else {
-                // Clear bit 7 to disable the alarm
-                if (_alarm[i] != -1) {
-                    local t = _alarm[i] & 0x7F;
-                    ast.writen(t, 'b');
-                    _alarm[i] = t;
+            foreach (i, param in params) {
+                if (param in alarm && alarm[param] != null) {
+                    // Set the alarm parameter
+                    if (_debug) server.log("Setting alarm " + param + " to " + alarm[param]);
+                    value = _integerToBCD(alarm[param] & andValue[i]);
                 } else {
-                    ast.writen(0, 'b');
+                    // Set bit 7 to disable the alarm parameter
+                    if (_alarmData[i] != 0x80) {
+                        value = _alarmData[i] | 0x80;
+                    } else {
+                        value = 0x80;
+                    }
                 }
+
+                alarmBlob[i] = value;
+                _alarmData[i] = value;
+            }
+
+            local err = _writeAlarm(alarmBlob);
+            if (_debug && err == 0) {
+                server.log("Alarm set (weekday:day:hour:mins) to " + format("0x%02X:0x%02X:0x%02X:0x%02X", _alarmData[3], _alarmData[2], _alarmData[1], _alarmData[0]));
+            }
+        } else {
+            local alarmSet = false;
+            foreach (param in _alarmData) {
+                if (param != 0x80) {
+                    alarmSet = true;
+                    break;
+                }
+            }
+
+            if (!alarmSet) {
+                server.error("PCF8563.setAlarm() requires an initial alarm time setting");
+                return;
             }
         }
 
-        local err = _writeAlarm(ast);
-         if (_debug && err == 0) server.log("Alarm set");
-         if (_debug) server.log(_alarm[0] + " : " + _alarm[1] + " : " + _alarm[2] + " : " + _alarm[3]);
-    }
 
-    function clearAlarm() {
-        local ast = "\x00\x00\x00\x00";
-        local err = _writeAlarm(ast);
-        if (_debug && err == 0) server.log("Alarm cleared");
-        _alarm = [-1, -1, -1, -1];
+        // Set AIE (bit 1) of CTRL_REG_2 to activate the alarm
+        // Also clear TIE (bit 0)
+        local r = _readReg(CTRL_REG_2);
+        r = (r | 0x02) & 0xFE;
+        _writeReg(CTRL_REG_2, r);
+        _alarmFlag = true;
+        if (_debug) server.log("Alarm enabled");
     }
 
     function unsetAlarm() {
-        local ast = blob();
-        foreach (i, c in _alarm) {
-            if (c != -1) {
-                c = c & 0x7F;
-                _alarm[i] = c;
-                ast.write(c, 'b');
-            } else {
-                ast.write(0, 'b');
-            }
+        // To stop the alarm from being triggered,
+        // just clear AIE (bit 1) of CTRL_REG_2
+        local r = _readReg(CTRL_REG_2) & 0xFD;
+        _writeReg(CTRL_REG_2, r);
+        _alarmFlag = false;
+        if (_debug) server.log("Alarm disabled");
+    }
+
+    function silenceAlarm() {
+        // To stop the alarm from 'ringing' clear the
+        // AF bit (3) of CTRL_REG_2
+        local r = _readReg(CTRL_REG_2) & 0xF7;
+        _writeReg(CTRL_REG_2, r);
+        if (_debug) server.log("Alarm silenced");
+    }
+
+    function clearAlarm() {
+        // Clear the AIE (bit 1) of CTRL_REG_2 to stop the alarm
+        // Also clear AF (bit 3) and TIE (bit 0)
+        local r = _readReg(CTRL_REG_2) & 0xF4;
+        _writeReg(CTRL_REG_2, r);
+        _alarmFlag = false;
+
+        local alarmBlob = blob(4);
+        for (local i = 0 ; i < 4 ; ++i) {
+            alarmBlob[i] = 0x80;
+            _alarmData[i] = 0x80;
         }
 
-        local err = _writeAlarm(ast);
-        if (_debug && err == 0) server.log("Alarm cleared");
+        local err = _writeAlarm(alarmBlob);
+        if (_debug && err == 0) server.log("Alarm cleared and disabled");
     }
 
     // ********** Private Functions - Do Not Call **********
@@ -227,9 +254,9 @@ class PCF8563 {
         return data[0];
     }
 
-    function _writeReg(register, byte) {
-        // Write data 'byte' to the specified register
-        local err = _i2c.write(_addr, format("%c%c", register, byte));
+    function _writeReg(register, databyte) {
+        // Write 'databyte' to the specified register
+        local err = _i2c.write(_addr, format("%c%c", register, databyte));
         if (err != 0) {
             server.error(format("I2C Write Failure. Device: 0x%02x Register: 0x%02x Error: %d", _addr, register, err));
         }
@@ -255,8 +282,8 @@ class PCF8563 {
         }
     }
 
-    function _writeAlarm(aTime) {
-        local err = _i2c.write(_addr, format("%c", MINS_ALARM_REG) + aTime.tostring());
+    function _writeAlarm(alarmBlob) {
+        local err = _i2c.write(_addr, format("%c", MINS_ALARM_REG) + alarmBlob.tostring());
         if (err != 0) {
             server.error(format("I2C Write Failure. Device: 0x%02x Error: %d", _addr, err));
         }
@@ -279,13 +306,10 @@ class PCF8563 {
 	}
 
 	function _interrupt() {
-	    if (_debug) server.log("Alarm!");
-	    _alarmCB();
-	}
-
-	function _getWakepin() {
-	    // imp001/2
-	    if ("pin1" in hardware) return hardware.pin1;
-	    return hardware.pinW;
+	    // Only want to trigger callback when INT pin goes low,
+	    // so use '_alarmFlag' to ensure callback isn't triggered
+	    // when INT floats again (when AF set to 0)
+	    if (_alarmFlag) _alarmCB();
+	    _alarmFlag = false;
 	}
 }
